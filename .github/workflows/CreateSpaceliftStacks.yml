@@ -7,9 +7,7 @@ on:
       - '**/*.tf'
 
 env:
-  SPACELIFT_API_KEY_ENDPOINT: https://o2ebrands.app.spacelift.io
-  SPACELIFT_API_KEY_ID: ${{ secrets.SPACELIFT_API_KEY_ID }}
-  SPACELIFT_API_KEY_SECRET: ${{ secrets.SPACELIFT_API_KEY_SECRET }}
+  SPACELIFT_API_ENDPOINT: https://o2ebrands.app.us.spacelift.io/graphql
 
 jobs:
   create-stacks:
@@ -21,12 +19,43 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Install Spacelift CLI
-        uses: spacelift-io/setup-spacectl@main
-        with:
-          version: latest
+      - name: Get Spacelift API Token
+        id: spacelift-token
+        run: |
+          echo "🔑 Authenticating with Spacelift..."
+          
+          RESPONSE=$(curl -s --request POST \
+            --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+            --header "Content-Type: application/json" \
+            --data '{
+              "query": "mutation GetSpaceliftToken($apiKeyId: ID!, $apiKeySecret: String!) { apiKeyUser(id: $apiKeyId, secret: $apiKeySecret) { jwt } }",
+              "variables": {
+                "apiKeyId": "${{ secrets.SPACELIFT_API_KEY_ID }}",
+                "apiKeySecret": "${{ secrets.SPACELIFT_API_KEY_SECRET }}"
+              }
+            }')
+          
+          # Check for errors
+          if echo "$RESPONSE" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "❌ Authentication failed:"
+            echo "$RESPONSE" | jq '.errors'
+            exit 1
+          fi
+          
+          TOKEN=$(echo "$RESPONSE" | jq -r '.data.apiKeyUser.jwt // empty')
+          
+          if [ -z "$TOKEN" ]; then
+            echo "❌ Failed to get JWT token. Response:"
+            echo "$RESPONSE"
+            exit 1
+          fi
+          
+          echo "✅ Authenticated successfully"
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
       - name: Get changed Terraform directories and create stacks
+        env:
+          SPACELIFT_TOKEN: ${{ steps.spacelift-token.outputs.token }}
         run: |
           #!/bin/bash
           set -e
@@ -82,47 +111,83 @@ jobs:
             echo "   Space ID: $space_id"
             echo "   Region: $region"
 
-            # Check if stack already exists using spacectl
+            # Check if stack already exists
             echo "🔎 Checking if stack exists..."
-            if spacectl stack show --id "$stack_name" > /dev/null 2>&1; then
+            STACK_CHECK=$(curl -s --request POST \
+              --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+              --header "Authorization: Bearer $SPACELIFT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{"query": "query { stack(id: \"'"$stack_name"'\") { id } }"}')
+            
+            EXISTING_ID=$(echo "$STACK_CHECK" | jq -r '.data.stack.id // empty')
+            
+            if [ -n "$EXISTING_ID" ]; then
               echo "✅ Stack '$stack_name' already exists"
               continue
             fi
 
-            # Create the stack using spacectl
+            # Create the stack
             echo "🚀 Creating stack '$stack_name'..."
-            
-            spacectl stack create \
-              --name "$stack_name" \
-              --space "$space_id" \
-              --repository "${{ github.repository }}" \
-              --branch "${{ github.ref_name }}" \
-              --project-root "$dir" \
-              --vendor terraform \
-              --terraform-version "1.5.0" \
-              --administrative=false \
-              --autodeploy=false \
-              --label "auto-created"
+            CREATE_RESULT=$(curl -s --request POST \
+              --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+              --header "Authorization: Bearer $SPACELIFT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{
+                "query": "mutation CreateStack($input: StackInput!) { stackCreate(input: $input) { id name } }",
+                "variables": {
+                  "input": {
+                    "name": "'"$stack_name"'",
+                    "space": "'"$space_id"'",
+                    "repository": "'"${{ github.repository }}"'",
+                    "branch": "'"${{ github.ref_name }}"'",
+                    "projectRoot": "'"$dir"'",
+                    "vendorConfig": {
+                      "terraform": {
+                        "version": "1.5.0",
+                        "workflowTool": "TERRAFORM_FOSS"
+                      }
+                    },
+                    "administrative": false,
+                    "autodeploy": false,
+                    "labels": ["auto-created"]
+                  }
+                }
+              }')
 
-            if [ $? -ne 0 ]; then
-              echo "❌ Failed to create stack '$stack_name'"
+            STACK_ID=$(echo "$CREATE_RESULT" | jq -r '.data.stackCreate.id // empty')
+            
+            if [ -z "$STACK_ID" ]; then
+              echo "❌ Failed to create stack. Response:"
+              echo "$CREATE_RESULT" | jq .
               continue
             fi
 
-            echo "✅ Stack '$stack_name' created successfully"
+            echo "✅ Stack created with ID: $STACK_ID"
 
             # Add TF_VAR_region environment variable
             echo "🔧 Adding TF_VAR_region environment variable..."
-            spacectl stack environment setvar \
-              --id "$stack_name" \
-              --name "TF_VAR_region" \
-              --value "$region" \
-              --plaintext
+            ENV_VAR_RESULT=$(curl -s --request POST \
+              --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+              --header "Authorization: Bearer $SPACELIFT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{
+                "query": "mutation AddEnvVar($stack: ID!, $config: ConfigInput!) { stackConfigAdd(stack: $stack, config: $config) { id } }",
+                "variables": {
+                  "stack": "'"$STACK_ID"'",
+                  "config": {
+                    "id": "TF_VAR_region",
+                    "type": "ENVIRONMENT_VARIABLE",
+                    "value": "'"$region"'",
+                    "writeOnly": false
+                  }
+                }
+              }')
 
-            if [ $? -eq 0 ]; then
+            if echo "$ENV_VAR_RESULT" | jq -e '.data.stackConfigAdd.id' > /dev/null 2>&1; then
               echo "✅ TF_VAR_region set to '$region'"
             else
-              echo "⚠️  Warning: Failed to add TF_VAR_region"
+              echo "⚠️  Warning: Failed to add TF_VAR_region. Response:"
+              echo "$ENV_VAR_RESULT" | jq .
             fi
 
             echo ""

@@ -58,14 +58,30 @@ jobs:
           SPACELIFT_TOKEN: ${{ steps.spacelift-token.outputs.token }}
         run: |
           #!/bin/bash
-          set -e
+          
+          # Track results
+          FAILED=0
+          SUCCESS=0
+          SKIPPED=0
 
           # Space ID mapping
           declare -A SPACE_IDS=(
-            ["itops"]="01KEFW3X8XZ2RBXYMZM87GP465"
-            ["salesforce-archive"]="01KEFW3X6GYK42PSP8GP1MC4R2"
-            ["sandbox"]="01KEFW3X89EHBRHQNY4NAGCE28"
+            ["itops"]="itops-01KEFW3X8XZ2RBXYMZM87GP465"
+            ["salesforce-archive"]="salesforce-archive-01KEFW3X6GYK42PSP8GP1MC4R2"
+            ["sandbox"]="sandbox-01KEFW3X89EHBRHQNY4NAGCE28"
           )
+
+          # List available spaces for debugging
+          echo "🔍 Fetching available spaces from Spacelift..."
+          SPACES_RESULT=$(curl -s --request POST \
+            --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+            --header "Authorization: Bearer $SPACELIFT_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data '{"query": "query { spaces { id name } }"}')
+          
+          echo "Available spaces:"
+          echo "$SPACES_RESULT" | jq -r '.data.spaces[] | "  - \(.id): \(.name)"' 2>/dev/null || echo "  (Unable to list spaces)"
+          echo ""
 
           # Get list of changed .tf files and extract unique directories
           echo "🔍 Getting changed Terraform files..."
@@ -100,7 +116,8 @@ jobs:
             space_id="${SPACE_IDS[$root_folder]}"
             
             if [ -z "$space_id" ]; then
-              echo "⚠️  Warning: No space ID mapping found for '$root_folder', skipping..."
+              echo "❌ Error: No space ID mapping found for '$root_folder', skipping..."
+              FAILED=$((FAILED + 1))
               continue
             fi
 
@@ -122,7 +139,8 @@ jobs:
             EXISTING_ID=$(echo "$STACK_CHECK" | jq -r '.data.stack.id // empty')
             
             if [ -n "$EXISTING_ID" ]; then
-              echo "✅ Stack '$stack_name' already exists"
+              echo "✅ Stack '$stack_name' already exists (skipping)"
+              SKIPPED=$((SKIPPED + 1))
               continue
             fi
 
@@ -160,10 +178,12 @@ jobs:
             if [ -z "$STACK_ID" ]; then
               echo "❌ Failed to create stack. Response:"
               echo "$CREATE_RESULT" | jq .
+              FAILED=$((FAILED + 1))
               continue
             fi
 
             echo "✅ Stack created with ID: $STACK_ID"
+            SUCCESS=$((SUCCESS + 1))
 
             # Add TF_VAR_region environment variable
             echo "🔧 Adding TF_VAR_region environment variable..."
@@ -195,4 +215,15 @@ jobs:
           done
 
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🎉 Stack creation process complete!"
+          echo "📊 SUMMARY"
+          echo "   ✅ Created: $SUCCESS"
+          echo "   ⏭️  Skipped (already exist): $SKIPPED"
+          echo "   ❌ Failed: $FAILED"
+          echo ""
+          
+          if [ $FAILED -gt 0 ]; then
+            echo "❌ Stack creation completed with $FAILED failure(s)"
+            exit 1
+          else
+            echo "🎉 Stack creation process complete!"
+          fi

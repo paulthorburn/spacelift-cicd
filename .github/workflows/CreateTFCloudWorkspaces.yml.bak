@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    # Runs a set of commands using the runners shell
+    - name: Run a multi-line script
+      run: |
+        #!/bin/bash
+        
+        # Set Some Variables
+        ITOpsARN=arn:aws:iam::983153391339:role/O2E-TerraformITOpsAccess
+        WorkspacesARN=arn:aws:iam::431152022607:role/O2E-TerraformWorkspacesAccess
+        SalesforceArchiveARN=arn:aws:iam::377178669889:role/O2E-TerraformWorkspacesAccess
+        SandboxARN=arn:aws:iam::478915255270:role/O2E-TerraformAccess
+        GlobalRegion=us-west-2
+        
+        # Get To Work
+        for i in $(find . | grep main.tf | sed 's/\.//')
+        do
+            fullname=$(dirname "$i")
+            workspacename=$(dirname "$i" | sed 's/\///' | sed 's/\//\-/g')
+            get_arn=$(echo "$fullname" | cut -d"/" -f2)
+            get_region=$(echo "$fullname" | cut -d"/" -f3)
+          
+            if [ "$get_arn" = "root" ]; then aws_role_arn=""; fi
+            if [ "$get_arn" = "itops" ]; then aws_role_arn=$ITOpsARN; fi
+            if [ "$get_arn" = "workspaces" ]; then aws_role_arn=$WorkspacesARN; fi
+            if [ "$get_arn" = "salesforce-archive" ]; then aws_role_arn=$SalesforceArchiveARN; fi
+            if [ "$get_arn" = "sandbox" ]; then aws_role_arn=$SandboxARN; fi
+            if [ "$get_region" = "global" ]; then aws_region=$GlobalRegion; fi
+            if [ "$get_region" != "global" ]; then aws_region=$get_region; fi
+ 
+ 
+            # Check To See If The Workspace Exists
+            check_workspace_result=$(curl -s --header "Authorization: Bearer ${{ secrets.tfe_token }}" --header "Content-Type: application/vnd.api+json" "https://app.terraform.io/api/v2/organizations/${{ secrets.tfe_organization }}/workspaces/$workspacename" | jq '.data.id')
+
+            if [ "$check_workspace_result" = "null" ]
+            then
+                # Creating Workspace
+                echo Creating Workspace "$workspacename"
+                workspace_id=$(curl -s --header "Authorization: Bearer ${{ secrets.tfe_token }}" --header "Content-Type: application/vnd.api+json" --request POST --data '{"data": {"attributes": {"name": "'$workspacename'","working-directory": "'$fullname'","vcs-repo": {"identifier": "'$GITHUB_REPOSITORY'","oauth-token-id": "'${{ secrets.tfe_oauth_token_id }}'","branch": "","default-branch": true},"allow-destroy-plan": "false"},"type": "workspaces"}}' "https://app.terraform.io/api/v2/organizations/${{ secrets.tfe_organization }}/workspaces/" | jq '.data.id' -r)
+                echo The Workspace ID is "$workspace_id"
+                sleep 1
+
+                # Creating Variables
+                echo Creating Workspace "$workspacename" Variables
+                curl -s --header "Authorization: Bearer ${{ secrets.tfe_token }}" --header "Content-Type: application/vnd.api+json" --request POST --data '{"data":{"type":"vars","attributes":{"key":"AWS_ACCESS_KEY_ID","value":"'${{ secrets.aws_access_key_id }}'","category":"env","hcl":false,"sensitive":true}}}' https://app.terraform.io/api/v2/workspaces/$workspace_id/vars > /dev/null 2>&1
+                curl -s --header "Authorization: Bearer ${{ secrets.tfe_token }}" --header "Content-Type: application/vnd.api+json" --request POST --data '{"data":{"type":"vars","attributes":{"key":"AWS_SECRET_ACCESS_KEY","value":"'${{ secrets.aws_secret_access_key }}'","category":"env","hcl":false,"sensitive":true}}}' https://app.terraform.io/api/v2/workspaces/$workspace_id/vars > /dev/null 2>&1
+                curl -s --header "Authorization: Bearer ${{ secrets.tfe_token }}" --header "Content-Type: application/vnd.api+json" --request POST --data '{"data":{"type":"vars","attributes":{"key":"aws_region","value":"'$aws_region'","category":"terraform","hcl":false,"sensitive":false}}}' https://app.terraform.io/api/v2/workspaces/$workspace_id/vars > /dev/null 2>&1
+                curl -s --header "Authorization: Bearer ${{ secrets.tfe_token }}" --header "Content-Type: application/vnd.api+json" --request POST --data '{"data":{"type":"vars","attributes":{"key":"aws_role_arn","value":"'$aws_role_arn'","category":"terraform","hcl":false,"sensitive":false}}}' https://app.terraform.io/api/v2/workspaces/$workspace_id/vars > /dev/null 2>&1
+                
+                # Add SSH Key
+                curl --header "Authorization: Bearer ${{ secrets.tfe_team_token }}" --header "Content-Type: application/vnd.api+json" --request PATCH --data '{"data":{"attributes":{"id":"sshkey-uLDtPnqeLV3eyQsh"},"type":"workspaces"}}' https://app.terraform.io/api/v2/workspaces/$workspace_id/relationships/ssh-key > /dev/null 2>&1
+                
+                # Triggering Plan
+                echo Queuing Workspace $workspacename Plan ID $workspace_id
+                curl -s --header "Authorization: Bearer ${{ secrets.tfe_team_token }}" --header "Content-Type: application/vnd.api+json" --request POST --data '{"data":{"attributes":{"is-destroy":false},"type":"runs","relationships":{"workspace":{"data":{"type":"workspaces","id":"'$workspace_id'"}}}}}' https://app.terraform.io/api/v2/runs > /dev/null 2>&1
+            else
+                echo The workspace "$workspacename" already existed
+            fi
+
+
+        done

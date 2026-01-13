@@ -1,0 +1,176 @@
+name: Create Spacelift Stacks
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '**/*.tf'
+
+env:
+  SPACELIFT_API_ENDPOINT: https://o2ebrands.app.spacelift.io/graphql
+
+jobs:
+  create-stacks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Get Spacelift API Token
+        id: spacelift-token
+        run: |
+          TOKEN=$(curl -s --request POST \
+            --url "https://o2ebrands.app.spacelift.io/oauth/token" \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "grant_type=client_credentials" \
+            --data-urlencode "client_id=${{ secrets.SPACELIFT_API_KEY_ID }}" \
+            --data-urlencode "client_secret=${{ secrets.SPACELIFT_API_KEY_SECRET }}" \
+            | jq -r '.access_token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Get changed Terraform directories and create stacks
+        env:
+          SPACELIFT_TOKEN: ${{ steps.spacelift-token.outputs.token }}
+        run: |
+          #!/bin/bash
+          set -e
+
+          # Space ID mapping
+          declare -A SPACE_IDS=(
+            ["itops"]="01KEFW3X8XZ2RBXYMZM87GP465"
+            ["salesforce-archive"]="01KEFW3X6GYK42PSP8GP1MC4R2"
+            ["sandbox"]="01KEFW3X89EHBRHQNY4NAGCE28"
+          )
+
+          # Get list of changed .tf files and extract unique directories
+          echo "🔍 Getting changed Terraform files..."
+          
+          # Handle initial commit vs subsequent commits
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            CHANGED_DIRS=$(git diff --name-only HEAD~1 HEAD | grep '\.tf$' | xargs -I{} dirname {} | sort -u)
+          else
+            # Initial commit - get all .tf files
+            CHANGED_DIRS=$(git ls-tree -r --name-only HEAD | grep '\.tf$' | xargs -I{} dirname {} | sort -u)
+          fi
+
+          if [ -z "$CHANGED_DIRS" ]; then
+            echo "📭 No Terraform directories changed in this commit"
+            exit 0
+          fi
+
+          echo "📁 Changed Terraform directories:"
+          echo "$CHANGED_DIRS"
+          echo ""
+
+          # Process each unique directory
+          for dir in $CHANGED_DIRS; do
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📂 Processing: $dir"
+            
+            # Extract components from path (e.g., sandbox/us-east-1/demo)
+            root_folder=$(echo "$dir" | cut -d'/' -f1)
+            region=$(echo "$dir" | cut -d'/' -f2)
+            
+            # Get space ID for this root folder
+            space_id="${SPACE_IDS[$root_folder]}"
+            
+            if [ -z "$space_id" ]; then
+              echo "⚠️  Warning: No space ID mapping found for '$root_folder', skipping..."
+              continue
+            fi
+
+            # Create stack name from directory path (replace / with -)
+            stack_name=$(echo "$dir" | sed 's/\//-/g')
+            
+            echo "   Stack Name: $stack_name"
+            echo "   Space ID: $space_id"
+            echo "   Region: $region"
+
+            # Check if stack already exists
+            echo "🔎 Checking if stack exists..."
+            STACK_EXISTS=$(curl -s --request POST \
+              --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+              --header "Authorization: Bearer $SPACELIFT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{
+                "query": "query GetStack($id: ID!) { stack(id: $id) { id } }",
+                "variables": { "id": "'"$stack_name"'" }
+              }' | jq -r '.data.stack.id // empty')
+
+            if [ -n "$STACK_EXISTS" ]; then
+              echo "✅ Stack '$stack_name' already exists"
+              continue
+            fi
+
+            # Create the stack
+            echo "🚀 Creating stack '$stack_name'..."
+            CREATE_RESULT=$(curl -s --request POST \
+              --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+              --header "Authorization: Bearer $SPACELIFT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{
+                "query": "mutation CreateStack($input: StackInput!) { stackCreate(input: $input) { id name } }",
+                "variables": {
+                  "input": {
+                    "name": "'"$stack_name"'",
+                    "space": "'"$space_id"'",
+                    "repository": "'"${{ github.repository }}"'",
+                    "branch": "'"${{ github.ref_name }}"'",
+                    "projectRoot": "'"$dir"'",
+                    "vendorConfig": {
+                      "terraform": {
+                        "version": "1.5.0",
+                        "workflowTool": "TERRAFORM_FOSS"
+                      }
+                    },
+                    "administrative": false,
+                    "autodeploy": false,
+                    "labels": ["auto-created"]
+                  }
+                }
+              }')
+
+            STACK_ID=$(echo "$CREATE_RESULT" | jq -r '.data.stackCreate.id // empty')
+            
+            if [ -z "$STACK_ID" ]; then
+              echo "❌ Failed to create stack. Response:"
+              echo "$CREATE_RESULT" | jq .
+              continue
+            fi
+
+            echo "✅ Stack created with ID: $STACK_ID"
+
+            # Add TF_VAR_region environment variable
+            echo "🔧 Adding TF_VAR_region environment variable..."
+            ENV_VAR_RESULT=$(curl -s --request POST \
+              --url "${{ env.SPACELIFT_API_ENDPOINT }}" \
+              --header "Authorization: Bearer $SPACELIFT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data '{
+                "query": "mutation AddEnvVar($stack: ID!, $config: ConfigInput!) { stackConfigAdd(stack: $stack, config: $config) { id } }",
+                "variables": {
+                  "stack": "'"$STACK_ID"'",
+                  "config": {
+                    "id": "TF_VAR_region",
+                    "type": "ENVIRONMENT_VARIABLE",
+                    "value": "'"$region"'",
+                    "writeOnly": false
+                  }
+                }
+              }')
+
+            if echo "$ENV_VAR_RESULT" | jq -e '.data.stackConfigAdd.id' > /dev/null 2>&1; then
+              echo "✅ TF_VAR_region set to '$region'"
+            else
+              echo "⚠️  Warning: Failed to add TF_VAR_region. Response:"
+              echo "$ENV_VAR_RESULT" | jq .
+            fi
+
+            echo ""
+          done
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "🎉 Stack creation process complete!"

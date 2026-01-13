@@ -133,7 +133,7 @@ jobs:
               --header "Authorization: Bearer $SPACELIFT_TOKEN" \
               --header "Content-Type: application/json" \
               --data '{
-                "query": "mutation CreateStack($input: StackInput!) { stackCreate(input: $input) { id name } }",
+                "query": "mutation CreateStack($input: StackInput!, $manageState: Boolean!) { stackCreate(input: $input, manageState: $manageState) { id name } }",
                 "variables": {
                   "input": {
                     "name": "'"$stack_name"'",
@@ -150,7 +150,8 @@ jobs:
                     "administrative": false,
                     "autodeploy": false,
                     "labels": ["auto-created"]
-                  }
+                  },
+                  "manageState": false
                 }
               }')
 

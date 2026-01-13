@@ -22,13 +22,38 @@ jobs:
       - name: Get Spacelift API Token
         id: spacelift-token
         run: |
-          TOKEN=$(curl -s --request POST \
+          echo "🔑 Requesting Spacelift API token..."
+          
+          RESPONSE=$(curl -s --request POST \
             --url "https://o2ebrands.app.spacelift.io/oauth/token" \
             --header "Content-Type: application/x-www-form-urlencoded" \
             --data-urlencode "grant_type=client_credentials" \
             --data-urlencode "client_id=${{ secrets.SPACELIFT_API_KEY_ID }}" \
-            --data-urlencode "client_secret=${{ secrets.SPACELIFT_API_KEY_SECRET }}" \
-            | jq -r '.access_token')
+            --data-urlencode "client_secret=${{ secrets.SPACELIFT_API_KEY_SECRET }}")
+          
+          # Check if response is valid JSON
+          if ! echo "$RESPONSE" | jq . > /dev/null 2>&1; then
+            echo "❌ Error: Spacelift API returned invalid JSON"
+            echo "Response (first 500 chars): ${RESPONSE:0:500}"
+            exit 1
+          fi
+          
+          # Check for error in response
+          ERROR=$(echo "$RESPONSE" | jq -r '.error // empty')
+          if [ -n "$ERROR" ]; then
+            ERROR_DESC=$(echo "$RESPONSE" | jq -r '.error_description // "No description"')
+            echo "❌ Error: $ERROR - $ERROR_DESC"
+            exit 1
+          fi
+          
+          TOKEN=$(echo "$RESPONSE" | jq -r '.access_token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "❌ Error: No access_token in response"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
+          
+          echo "✅ Successfully obtained Spacelift API token"
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
 
       - name: Get changed Terraform directories and create stacks
